@@ -98,8 +98,8 @@ type entry struct {
 	p unsafe.Pointer // *V
 }
 
-func newEntry[V any](i V) *entry {
-	return &entry{p: unsafe.Pointer(&i)}
+func newEntry[V any](i *V) *entry {
+	return &entry{p: unsafe.Pointer(i)}
 }
 
 func (m *Map[K, V]) loadReadOnly() readOnly[K] {
@@ -112,7 +112,7 @@ func (m *Map[K, V]) loadReadOnly() readOnly[K] {
 // Load returns the value stored in the map for a key, or nil if no
 // value is present.
 // The ok result indicates whether value was found in the map.
-func (m *Map[K, V]) Load(key K) (value V, ok bool) {
+func (m *Map[K, V]) Load(key K) (value *V, ok bool) {
 	read := m.loadReadOnly()
 	e, ok := read.m[key]
 	if !ok && read.amended {
@@ -137,18 +137,18 @@ func (m *Map[K, V]) Load(key K) (value V, ok bool) {
 	return entryLoad[V](e)
 }
 
-func entryLoad[V any](e *entry) (value V, ok bool) {
+func entryLoad[V any](e *entry) (value *V, ok bool) {
 	p := atomic.LoadPointer(&e.p)
 	if p == nil || p == expunged {
 		return
 	}
-	return *(*V)(p), true
+	return (*V)(p), true
 }
 
 // Store sets the value for a key.
-func (m *Map[K, V]) Store(key K, value V) {
+func (m *Map[K, V]) Store(key K, value *V) {
 	read := m.loadReadOnly()
-	if e, ok := read.m[key]; ok && tryStore(e, &value) {
+	if e, ok := read.m[key]; ok && tryStore(e, value) {
 		return
 	}
 
@@ -160,9 +160,9 @@ func (m *Map[K, V]) Store(key K, value V) {
 			// non-nil dirty map and this entry is not in it.
 			m.dirty[key] = e
 		}
-		entryStoreLocked(e, &value)
+		entryStoreLocked(e, value)
 	} else if e, ok := m.dirty[key]; ok {
-		entryStoreLocked(e, &value)
+		entryStoreLocked(e, value)
 	} else {
 		if !read.amended {
 			// We're adding the first new key to the dirty map.
@@ -209,7 +209,7 @@ func entryStoreLocked[V any](e *entry, i *V) {
 // LoadOrStore returns the existing value for the key if present.
 // Otherwise, it stores and returns the given value.
 // The loaded result is true if the value was loaded, false if stored.
-func (m *Map[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
+func (m *Map[K, V]) LoadOrStore(key K, value *V) (actual *V, loaded bool) {
 	// Avoid locking if it's a clean hit.
 	read := m.loadReadOnly()
 	if e, ok := read.m[key]; ok {
@@ -249,13 +249,13 @@ func (m *Map[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
 //
 // If the entry is expunged, entryTryLoadOrStore leaves the entry unchanged and
 // returns with ok==false.
-func entryTryLoadOrStore[V any](e *entry, i V) (actual V, loaded, ok bool) {
+func entryTryLoadOrStore[V any](e *entry, i *V) (actual *V, loaded, ok bool) {
 	p := atomic.LoadPointer(&e.p)
 	if p == expunged {
 		return
 	}
 	if p != nil {
-		return *(*V)(p), true, true
+		return (*V)(p), true, true
 	}
 
 	// Copy the interface after the first load to make this method more amenable
@@ -271,14 +271,14 @@ func entryTryLoadOrStore[V any](e *entry, i V) (actual V, loaded, ok bool) {
 			return
 		}
 		if p != nil {
-			return *(*V)(p), true, true
+			return (*V)(p), true, true
 		}
 	}
 }
 
 // LoadAndDelete deletes the value for a key, returning the previous value if any.
 // The loaded result reports whether the key was present.
-func (m *Map[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
+func (m *Map[K, V]) LoadAndDelete(key K) (value *V, loaded bool) {
 	read := m.loadReadOnly()
 	e, ok := read.m[key]
 	if !ok && read.amended {
@@ -306,16 +306,116 @@ func (m *Map[K, V]) Delete(key K) {
 	m.LoadAndDelete(key)
 }
 
-func entryDelete[V any](e *entry) (value V, ok bool) {
+func entryDelete[V any](e *entry) (value *V, ok bool) {
 	for {
 		p := atomic.LoadPointer(&e.p)
 		if p == nil || p == expunged {
 			return
 		}
 		if atomic.CompareAndSwapPointer(&e.p, p, nil) {
-			return *(*V)(p), true
+			return (*V)(p), true
 		}
 	}
+}
+
+// entryTrySwap swaps a value if the entry has not been expunged.
+//
+// If the entry is expunged, entryTrySwap returns false and leaves the entry
+// unchanged.
+func entryTrySwap[V any](e *entry, i *V) (*V, bool) {
+	for {
+		p := atomic.LoadPointer(&e.p)
+		if p == expunged {
+			return nil, false
+		}
+		if atomic.CompareAndSwapPointer(&e.p, p, unsafe.Pointer(i)) {
+			return (*V)(p), true
+		}
+	}
+}
+
+func entrySwapLocked[V any](e *entry, i *V) *V {
+	return (*V)(atomic.SwapPointer(&e.p, unsafe.Pointer(i)))
+}
+
+// Swap swaps the value for a key and returns the previous value if any.
+// The loaded result reports whether the key was present.
+func (m *Map[K, V]) Swap(key K, value *V) (previous *V, loaded bool) {
+	read := m.loadReadOnly()
+	if e, ok := read.m[key]; ok {
+		if v, ok := entryTrySwap(e, value); ok {
+			if v == nil {
+				return nil, false
+			}
+			return v, true
+		}
+	}
+
+	m.mu.Lock()
+	read = m.loadReadOnly()
+	if e, ok := read.m[key]; ok {
+		if e.unexpungeLocked() {
+			// The entry was previously expunged, which implies that there is a
+			// non-nil dirty map and this entry is not in it.
+			m.dirty[key] = e
+		}
+		if v := entrySwapLocked(e, value); v != nil {
+			loaded = true
+			previous = v
+		}
+	} else if e, ok := m.dirty[key]; ok {
+		if v := entrySwapLocked(e, value); v != nil {
+			loaded = true
+			previous = v
+		}
+	} else {
+		if !read.amended {
+			// We're adding the first new key to the dirty map.
+			// Make sure it is allocated and mark the read-only map as incomplete.
+			m.dirtyLocked()
+			m.read.Store(&readOnly[K]{m: read.m, amended: true})
+		}
+		m.dirty[key] = newEntry(value)
+	}
+	m.mu.Unlock()
+	return previous, loaded
+}
+
+// CompareAndDelete deletes the entry for key if its value is equal to old.
+// The old value must be of a comparable type.
+//
+// If there is no current value for key in the map, CompareAndDelete
+// returns false (even if the old value is the nil interface value).
+func (m *Map[K, V]) CompareAndDelete(key K, old *V) (deleted bool) {
+	read := m.loadReadOnly()
+	e, ok := read.m[key]
+	if !ok && read.amended {
+		m.mu.Lock()
+		read = m.loadReadOnly()
+		e, ok = read.m[key]
+		if !ok && read.amended {
+			e, ok = m.dirty[key]
+			// Don't delete key from m.dirty: we still need to do the “compare” part
+			// of the operation. The entry will eventually be expunged when the
+			// dirty map is promoted to the read map.
+			//
+			// Regardless of whether the entry was present, record a miss: this key
+			// will take the slow path until the dirty map is promoted to the read
+			// map.
+			m.missLocked()
+		}
+		m.mu.Unlock()
+	}
+	for ok {
+		p := atomic.LoadPointer(&e.p)
+		if p == nil || p == expunged || (*V)(p) != old {
+			return false
+		}
+		if atomic.CompareAndSwapPointer(&e.p, p, nil) {
+			return true
+		}
+	}
+	return false
 }
 
 // Range calls f sequentially for each key and value present in the map.
@@ -329,7 +429,7 @@ func entryDelete[V any](e *entry) (value V, ok bool) {
 //
 // Range may be O(N) with the number of elements in the map even if f returns
 // false after a constant number of calls.
-func (m *Map[K, V]) Range(f func(key K, value V) bool) {
+func (m *Map[K, V]) Range(f func(key K, value *V) bool) {
 	// We need to be able to iterate over all of the keys that were already
 	// present at the start of the call to Range.
 	// If read.amended is false, then read.m satisfies that property without
