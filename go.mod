@@ -1,3 +1,3 @@
-module github.com/RomiChan/syncx
+module github.com/LXY1226/syncx
 
 go 1.19
